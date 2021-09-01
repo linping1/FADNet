@@ -27,6 +27,10 @@ from path import Path
 
 from utils.preprocess import scale_disp, default_transform
 from networks.FADNet import FADNet
+from networks.DispNetC import DispNetC
+from networks.GANet_deep import GANet
+from networks.stackhourglass import PSMNet
+from networks.aanet import AANet
 
 parser = argparse.ArgumentParser(description='FADNet')
 parser.add_argument('--crop_height', type=int, required=True, help="crop height")
@@ -69,18 +73,26 @@ if opt.cuda:
 
 if opt.model == 'psmnet':
     model = PSMNet(opt.maxdisp)
+elif opt.model == 'ganet':
+    model = GANet(opt.maxdisp)
+elif opt.model == 'aanet':
+    model = AANet(opt.maxdisp)
 elif opt.model == 'fadnet':
     model = FADNet(maxdisp=opt.maxdisp)
+elif opt.model == 'dispnetc':
+    model = DispNetC(resBlock=False, maxdisp=opt.maxdisp)
+elif opt.model == 'crl':
+    model = FADNet(resBlock=False, maxdisp=opt.maxdisp)
 else:
     print('no model')
     sys.exit(-1)
 
+model = nn.DataParallel(model, device_ids=[0])
+model.cuda()
+
 if opt.loadmodel is not None:
     state_dict = torch.load(opt.loadmodel)
     model.load_state_dict(state_dict['state_dict'])
-
-model = nn.DataParallel(model, device_ids=[0])
-model.cuda()
 
 print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
@@ -247,10 +259,13 @@ def test_md(leftname, rightname, savename):
     temp = temp[0, :height, :width]
 
     # print epe
+    thres = 400
+    if 'trainingQ' in leftname:
+        thres = 192
     if 'training' in leftname:
         gt_disp, _, _ = readPFM(leftname.replace('im0.png', 'disp0GT.pfm'))
         gt_disp[np.isinf(gt_disp)] = 0
-        mask = (gt_disp > 0) & (gt_disp < 400)
+        mask = (gt_disp > 0) & (gt_disp < thres)
         epe = np.mean(np.abs(gt_disp[mask] - temp[mask])) 
         print(savename, epe, np.min(gt_disp), np.max(gt_disp))
 
@@ -259,9 +274,9 @@ def test_md(leftname, rightname, savename):
 
     disppath = Path(savepfm_path)
     disppath.makedirs_p()
-    save_pfm(savepfm_path+'/disp0FADNet_RVC.pfm', temp, scale=1)
+    save_pfm(savepfm_path+'/disp0FADNet++.pfm', temp, scale=1)
     ##########write time txt########
-    fp = open(savepfm_path+'/timeFADNet_RVC.txt', 'w')
+    fp = open(savepfm_path+'/timeFADNet++.txt', 'w')
     runtime = "%.4f" % (end_time - start_time)  
     fp.write(runtime)   
     fp.close()
@@ -352,35 +367,55 @@ def test_kitti(leftname, rightname, savename):
     return epe
 
 
-def test(leftname, rightname, savename):  
-    input1, input2, height, width = test_transform(load_data(leftname, rightname), opt.crop_height, opt.crop_width)
+def test(leftname, rightname, savename, gt_disp):  
+    input1, input2, height, width = load_data_imn(leftname, rightname)
 
     input1 = Variable(input1, requires_grad = False)
     input2 = Variable(input2, requires_grad = False)
 
     model.eval()
-    if cuda:
+    start_time = time()
+
+    if opt.cuda:
         input1 = input1.cuda()
         input2 = input2.cuda()
-
-    start_time = time()
+        input_var = torch.cat((input1, input2), 0)
+        input_var = input_var.unsqueeze(0)
     with torch.no_grad():
-        prediction = model(input1, input2)
+        predictions = model(input_var)
+        if len(predictions) == 5: # aanet
+            prediction = predictions[-1]
+        elif len(predictions) > 2: # ganet, psmnet
+            prediction = predictions[0]
+        elif len(predictions) == 2: # two-stage nets
+            prediction = predictions[1]
+        else:
+            prediction = predictions
+        if prediction.dim() == 4:
+            prediction = prediction.squeeze(0)
+
     end_time = time()
-    
     print("Processing time: {:.4f}".format(end_time - start_time))
+
     temp = prediction.cpu()
     temp = temp.detach().numpy()
-    if height <= opt.crop_height or width <= opt.crop_width:
-        temp = temp[0, opt.crop_height - height: opt.crop_height, opt.crop_width - width: opt.crop_width]
-    else:
-        temp = temp[0, :, :]
-    plot_disparity(savename, temp, 192)
+    temp = temp[0, :height, :width]
+
+    plot_disparity(savename, temp, np.max(gt_disp)+5, cmap='rainbow')
+
+    mask = (gt_disp > 0) & (gt_disp < 192)
+    epe = np.mean(np.abs(gt_disp[mask] - temp[mask])) 
+    err_map = np.abs(temp - gt_disp)
+    err_name = savename.replace('disp', 'err')
+    plot_disparity(err_name, err_map, 30, cmap='turbo')
+
     savename_pfm = savename.replace('png','pfm') 
     temp = np.flipud(temp)
 
-def plot_disparity(savename, data, max_disp):
-    plt.imsave(savename, data, vmin=0, vmax=max_disp, cmap='turbo')
+    return epe
+
+def plot_disparity(savename, data, max_disp, cmap='turbo'):
+    plt.imsave(savename, data, vmin=0, vmax=max_disp, cmap=cmap)
 
    
 if __name__ == "__main__":
@@ -399,15 +434,17 @@ if __name__ == "__main__":
             error += test_kitti(leftname, rightname, savename)
 
         if opt.sceneflow:
-            leftname = file_path + 'frames_finalpass/' + current_file[0: len(current_file) - 1]
-            rightname = file_path + 'frames_finalpass/' + current_file[0: len(current_file) - 14] + 'right/' + current_file[len(current_file) - 9:len(current_file) - 1]
-            leftgtname = file_path + 'disparity/' + current_file[0: len(current_file) - 4] + 'pfm'
+            leftname = file_path + current_file[0]
+            rightname = file_path + current_file[1] 
+            leftgtname = file_path + current_file[2]
             disp_left_gt, height, width = readPFM(leftgtname)
-            savenamegt = opt.savepath + "{:d}_gt.png".format(index)
-            plot_disparity(savenamegt, disp_left_gt, 192)
+            savenamegt = opt.savepath + "gt_" + "_".join(current_file[2].split("/")[-4:]).replace('pfm', 'png').replace('left', 'disp')
+            plot_disparity(savenamegt, disp_left_gt, np.max(disp_left_gt)+5, cmap='rainbow')
 
-            savename = opt.savepath + "{:d}.png".format(index)
-            test(leftname, rightname, savename)
+            savename = opt.savepath + "%s_" % opt.model + "_".join(current_file[2].split("/")[-4:]).replace('pfm', 'png').replace('left', 'disp')
+            epe = test(leftname, rightname, savename, disp_left_gt)
+            error += epe
+            print(leftname, rightname, savename, epe)
 
         if opt.middlebury:
             leftname = file_path + current_file[0]
@@ -423,5 +460,8 @@ if __name__ == "__main__":
             rightname = file_path + current_file[1]
             savename = opt.savepath + "low_res_two_view/" + leftname.split("/")[-2] + ".pfm"
             error += test_eth3d(leftname, rightname, savename)
+
+        if index > 200:
+            break
     print("EPE:", error / len(filelist))
 
